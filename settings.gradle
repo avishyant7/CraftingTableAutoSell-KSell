@@ -6,12 +6,4 @@ pluginManagement {
     }
 }
 
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
-    repositories {
-        maven { url = uri("https://maven.fabricmc.net/") }
-        mavenCentral()
-    }
-}
-
 rootProject.name = "KSell"
