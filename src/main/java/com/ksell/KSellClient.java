@@ -15,7 +15,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 public final class KSellClient implements ClientModInitializer {
-    private final Seller seller = new Seller();
+    private final SplitTest splitTest = new SplitTest();
 
     @Override
     public void onInitializeClient() {
@@ -24,32 +24,38 @@ public final class KSellClient implements ClientModInitializer {
                     .then(ClientCommands.literal("on")
                             .then(ClientCommands.argument("price", LongArgumentType.longArg(1))
                                     .executes(context -> {
-                                        seller.start(LongArgumentType.getLong(context, "price"));
+                                        splitTest.start(LongArgumentType.getLong(context, "price"));
                                         return 1;
                                     }))));
 
             dispatcher.register(ClientCommands.literal("ksel")
                     .then(ClientCommands.literal("off")
                             .executes(context -> {
-                                seller.stop(true);
+                                splitTest.stop(true);
                                 return 1;
                             })));
         });
 
-        ClientTickEvents.END_CLIENT_TICK.register(seller::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(splitTest::tick);
     }
 
-    private static final class Seller {
-        private static final int SELL_DELAY_TICKS = 30;
+    private static final class SplitTest {
+        private enum State {
+            IDLE,
+            MOVE_DEDICATED_ITEM,
+            PICKUP_SOURCE,
+            PLACE_ONE,
+            RETURN_REMAINDER,
+            DONE
+        }
 
         private boolean enabled;
         private long price;
         private int dedicatedHotbarSlot;
-        private int cooldown;
-        private int pendingRestoreSlot = -1;
-        private int pendingRestoreScreenSlot = -1;
-        private boolean waitingForSaleSync;
-        private boolean operationPending;
+        private int sourceInventorySlot = -1;
+        private int bufferInventorySlot = -1;
+        private State state = State.IDLE;
+        private int waitTicks;
 
         void start(long newPrice) {
             Minecraft client = Minecraft.getInstance();
@@ -60,24 +66,22 @@ public final class KSellClient implements ClientModInitializer {
             enabled = true;
             price = newPrice;
             dedicatedHotbarSlot = client.player.getInventory().getSelectedSlot();
-            cooldown = 0;
-            pendingRestoreSlot = -1;
-            pendingRestoreScreenSlot = -1;
-            waitingForSaleSync = false;
-            operationPending = false;
+            sourceInventorySlot = -1;
+            bufferInventorySlot = -1;
+            state = State.IDLE;
+            waitTicks = 0;
 
-            client.player.sendSystemMessage(
-                    Component.literal("KSell: ON, selling Respawn Anchors for $" + newPrice + " each.")
-            );
+            client.player.sendSystemMessage(Component.literal(
+                    "KSell: DIAGNOSTIC ON. Splitting exactly 1 Respawn Anchor. No selling."
+            ));
         }
 
         void stop(boolean announce) {
             enabled = false;
-            cooldown = 0;
-            waitingForSaleSync = false;
-            operationPending = false;
-            pendingRestoreSlot = -1;
-            pendingRestoreScreenSlot = -1;
+            state = State.IDLE;
+            waitTicks = 0;
+            sourceInventorySlot = -1;
+            bufferInventorySlot = -1;
 
             if (announce) {
                 Minecraft client = Minecraft.getInstance();
@@ -96,11 +100,6 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
-            if (cooldown > 0) {
-                cooldown--;
-                return;
-            }
-
             LocalPlayer player = client.player;
             Inventory inventory = player.getInventory();
 
@@ -109,177 +108,175 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
-            int dedicatedInventorySlot = dedicatedHotbarSlot;
-            ItemStack dedicatedStack = inventory.getItem(dedicatedInventorySlot);
-
-            if (operationPending) {
-                if (isExactlyOneAnchor(dedicatedStack)) {
-                    operationPending = false;
-                    sell(client);
-                }
+            if (waitTicks > 0) {
+                waitTicks--;
                 return;
             }
 
-            if (waitingForSaleSync) {
-                if (!dedicatedStack.isEmpty()) {
-                    return;
-                }
-
-                if (pendingRestoreSlot >= 0) {
-                    restoreOldDedicatedItem(client);
-                }
-
-                waitingForSaleSync = false;
-                cooldown = SELL_DELAY_TICKS;
-                return;
-            }
-
-            if (isExactlyOneAnchor(dedicatedStack)) {
-                sell(client);
-                return;
-            }
-
-            int source = findAnchorSlot(inventory, dedicatedInventorySlot);
-
-            if (source < 0 && isAnchor(dedicatedStack)) {
-                if (dedicatedStack.getCount() == 1) {
-                    sell(client);
-                    return;
-                }
-
-                int buffer = findEmptyInventorySlot(inventory, dedicatedInventorySlot, -1);
-                if (buffer < 0) {
-                    return;
-                }
-
-                int dedicatedScreenSlot = playerScreenSlot(dedicatedInventorySlot);
-                int bufferScreenSlot = playerScreenSlot(buffer);
-
-                click(client, dedicatedScreenSlot, 0, ContainerInput.PICKUP);
-                click(client, bufferScreenSlot, 0, ContainerInput.PICKUP);
-
-                if (!inventory.getItem(dedicatedInventorySlot).isEmpty()) {
-                    return;
-                }
-
-                pendingRestoreSlot = buffer;
-                pendingRestoreScreenSlot = bufferScreenSlot;
-                splitOneIntoDedicated(client, buffer);
-                operationPending = true;
-                return;
-            }
-
-            if (source < 0) {
-                stop(false);
-                player.sendSystemMessage(
-                        Component.literal("KSell: OFF, no Respawn Anchors left.")
-                );
-                return;
-            }
-
-            prepareDedicatedSlot(client, source);
-        }
-
-        private void sell(Minecraft client) {
-            LocalPlayer player = client.player;
-            if (player == null || client.getConnection() == null) {
-                return;
-            }
-
-            ItemStack hand = player.getInventory().getItem(dedicatedHotbarSlot);
-            if (!isExactlyOneAnchor(hand)) {
-                return;
-            }
-
-            client.getConnection().sendCommand("ah sell " + price);
-            waitingForSaleSync = true;
-        }
-
-        private void prepareDedicatedSlot(Minecraft client, int source) {
-            LocalPlayer player = client.player;
-            if (player == null || client.gameMode == null) {
-                return;
-            }
-
-            Inventory inventory = player.getInventory();
+            AbstractContainerMenu menu = player.containerMenu;
+            ItemStack carried = menu.getCarried();
             ItemStack dedicated = inventory.getItem(dedicatedHotbarSlot);
 
+            switch (state) {
+                case IDLE -> begin(client, inventory, dedicated, carried);
+                case MOVE_DEDICATED_ITEM -> moveDedicatedItem(client, inventory, dedicated, carried);
+                case PICKUP_SOURCE -> pickupSource(client, inventory, dedicated, carried);
+                case PLACE_ONE -> placeOne(client, inventory, dedicated, carried);
+                case RETURN_REMAINDER -> returnRemainder(client, inventory, dedicated, carried);
+                case DONE -> {
+                    enabled = false;
+                    state = State.IDLE;
+                    player.sendSystemMessage(Component.literal(
+                            "KSell: TEST COMPLETE. Dedicated slot contains exactly 1 Respawn Anchor. No sale performed."
+                    ));
+                }
+            }
+        }
+
+        private void begin(Minecraft client, Inventory inventory, ItemStack dedicated, ItemStack carried) {
+            if (!carried.isEmpty()) {
+                return;
+            }
+
+            sourceInventorySlot = findAnchorSlot(inventory, dedicatedHotbarSlot);
+            if (sourceInventorySlot < 0) {
+                stop(false);
+                client.player.sendSystemMessage(Component.literal(
+                        "KSell: OFF, no Respawn Anchors found."
+                ));
+                return;
+            }
+
+            if (!dedicated.isEmpty()) {
+                bufferInventorySlot = findEmptyInventorySlot(
+                        inventory, sourceInventorySlot, dedicatedHotbarSlot
+                );
+                if (bufferInventorySlot < 0) {
+                    client.player.sendSystemMessage(Component.literal(
+                            "KSell: TEST PAUSED. Selected hotbar slot is occupied and no empty inventory slot is available."
+                    ));
+                    return;
+                }
+                state = State.MOVE_DEDICATED_ITEM;
+                return;
+            }
+
+            state = State.PICKUP_SOURCE;
+        }
+
+        private void moveDedicatedItem(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!carried.isEmpty()) {
+                return;
+            }
+
             if (dedicated.isEmpty()) {
-                splitOneIntoDedicated(client, source);
-                operationPending = true;
+                state = State.PICKUP_SOURCE;
                 return;
             }
 
-            int buffer = findEmptyInventorySlot(inventory, source, dedicatedHotbarSlot);
-            if (buffer < 0) {
-                return;
-            }
-
-            int dedicatedScreenSlot = playerScreenSlot(dedicatedHotbarSlot);
-            int bufferScreenSlot = playerScreenSlot(buffer);
-
-            click(client, dedicatedScreenSlot, 0, ContainerInput.PICKUP);
-            click(client, bufferScreenSlot, 0, ContainerInput.PICKUP);
-
-            if (!inventory.getItem(dedicatedHotbarSlot).isEmpty()) {
-                return;
-            }
-
-            pendingRestoreSlot = buffer;
-            pendingRestoreScreenSlot = bufferScreenSlot;
-
-            splitOneIntoDedicated(client, source);
-            operationPending = true;
-        }
-
-        private void splitOneIntoDedicated(Minecraft client, int source) {
-            LocalPlayer player = client.player;
-            if (player == null || client.gameMode == null) {
-                return;
-            }
-
-            Inventory inventory = player.getInventory();
-            ItemStack sourceStack = inventory.getItem(source);
-
-            if (!isAnchor(sourceStack) || sourceStack.isEmpty()) {
-                return;
-            }
-
-            if (!inventory.getItem(dedicatedHotbarSlot).isEmpty()) {
-                return;
-            }
-
-            int sourceScreenSlot = playerScreenSlot(source);
-            int dedicatedScreenSlot = playerScreenSlot(dedicatedHotbarSlot);
-
-            click(client, sourceScreenSlot, 0, ContainerInput.PICKUP);
-            click(client, dedicatedScreenSlot, 1, ContainerInput.PICKUP);
-            click(client, sourceScreenSlot, 0, ContainerInput.PICKUP);
-        }
-
-        private void restoreOldDedicatedItem(Minecraft client) {
-            if (client.player == null || client.gameMode == null || pendingRestoreSlot < 0) {
-                return;
-            }
-
-            Inventory inventory = client.player.getInventory();
-
-            if (!inventory.getItem(dedicatedHotbarSlot).isEmpty()) {
-                return;
-            }
-
-            ItemStack bufferStack = inventory.getItem(pendingRestoreSlot);
-            if (bufferStack.isEmpty()) {
-                pendingRestoreSlot = -1;
-                pendingRestoreScreenSlot = -1;
-                return;
-            }
-
-            click(client, pendingRestoreScreenSlot, 0, ContainerInput.PICKUP);
             click(client, playerScreenSlot(dedicatedHotbarSlot), 0, ContainerInput.PICKUP);
+            waitTicks = 1;
+        }
 
-            pendingRestoreSlot = -1;
-            pendingRestoreScreenSlot = -1;
+        private void pickupSource(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!carried.isEmpty() || !dedicated.isEmpty()) {
+                return;
+            }
+
+            ItemStack source = inventory.getItem(sourceInventorySlot);
+            if (!isAnchor(source) || source.getCount() < 1) {
+                fail(client, "source anchor stack changed before pickup");
+                return;
+            }
+
+            click(client, playerScreenSlot(sourceInventorySlot), 0, ContainerInput.PICKUP);
+            waitTicks = 1;
+            state = State.PLACE_ONE;
+        }
+
+        private void placeOne(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (dedicated.isEmpty() && carried.isEmpty()) {
+                fail(client, "server did not give the source stack to the cursor");
+                return;
+            }
+
+            if (!dedicated.isEmpty()) {
+                fail(client, "dedicated slot became occupied before the one-item split");
+                return;
+            }
+
+            if (!isAnchor(carried) || carried.getCount() < 1) {
+                fail(client, "cursor does not contain Respawn Anchors");
+                return;
+            }
+
+            click(client, playerScreenSlot(dedicatedHotbarSlot), 1, ContainerInput.PICKUP);
+            waitTicks = 1;
+            state = State.RETURN_REMAINDER;
+        }
+
+        private void returnRemainder(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!isExactlyOneAnchor(dedicated)) {
+                if (carried.isEmpty()) {
+                    fail(client, "one-item placement was not synchronized");
+                }
+                return;
+            }
+
+            if (carried.isEmpty()) {
+                fail(client, "cursor became empty before returning the remainder");
+                return;
+            }
+
+            if (!isAnchor(carried)) {
+                fail(client, "cursor changed to a non-anchor item");
+                return;
+            }
+
+            ItemStack source = inventory.getItem(sourceInventorySlot);
+
+            if (source.isEmpty()) {
+                click(client, playerScreenSlot(sourceInventorySlot), 0, ContainerInput.PICKUP);
+                waitTicks = 1;
+                return;
+            }
+
+            if (!isAnchor(source)) {
+                fail(client, "source slot changed to a different item");
+                return;
+            }
+
+            fail(client, "source slot was not empty after pickup; server rejected the transaction");
+        }
+
+        private void fail(Minecraft client, String reason) {
+            enabled = false;
+            state = State.IDLE;
+            if (client.player != null) {
+                client.player.sendSystemMessage(Component.literal(
+                        "KSell: TEST FAILED: " + reason
+                ));
+            }
         }
 
         private static void click(
@@ -292,9 +289,9 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
-            AbstractContainerMenu handler = client.player.containerMenu;
+            AbstractContainerMenu menu = client.player.containerMenu;
             client.gameMode.handleContainerInput(
-                    handler.containerId,
+                    menu.containerId,
                     slot,
                     button,
                     action,
@@ -302,20 +299,12 @@ public final class KSellClient implements ClientModInitializer {
             );
         }
 
-        private static int findAnchorSlot(
-                Inventory inventory,
-                int excludedHotbarSlot
-        ) {
+        private static int findAnchorSlot(Inventory inventory, int excludedHotbarSlot) {
             for (int slot = 0; slot < 36; slot++) {
-                if (slot == excludedHotbarSlot) {
-                    continue;
-                }
-
-                if (isAnchor(inventory.getItem(slot))) {
+                if (slot != excludedHotbarSlot && isAnchor(inventory.getItem(slot))) {
                     return slot;
                 }
             }
-
             return -1;
         }
 
@@ -325,15 +314,12 @@ public final class KSellClient implements ClientModInitializer {
                 int excludedB
         ) {
             for (int slot = 0; slot < 36; slot++) {
-                if (slot == excludedA || slot == excludedB) {
-                    continue;
-                }
-
-                if (inventory.getItem(slot).isEmpty()) {
+                if (slot != excludedA
+                        && slot != excludedB
+                        && inventory.getItem(slot).isEmpty()) {
                     return slot;
                 }
             }
-
             return -1;
         }
 
@@ -346,11 +332,7 @@ public final class KSellClient implements ClientModInitializer {
         }
 
         private static int playerScreenSlot(int inventorySlot) {
-            if (inventorySlot >= 0 && inventorySlot < 9) {
-                return 36 + inventorySlot;
-            }
-
-            return inventorySlot;
+            return inventorySlot < 9 ? 36 + inventorySlot : inventorySlot;
         }
     }
 }
