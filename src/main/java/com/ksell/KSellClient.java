@@ -15,7 +15,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 public final class KSellClient implements ClientModInitializer {
-    private final SplitTest splitTest = new SplitTest();
+    private final Seller seller = new Seller();
 
     @Override
     public void onInitializeClient() {
@@ -24,22 +24,22 @@ public final class KSellClient implements ClientModInitializer {
                     .then(ClientCommands.literal("on")
                             .then(ClientCommands.argument("price", LongArgumentType.longArg(1))
                                     .executes(context -> {
-                                        splitTest.start(LongArgumentType.getLong(context, "price"));
+                                        seller.start(LongArgumentType.getLong(context, "price"));
                                         return 1;
                                     }))));
 
             dispatcher.register(ClientCommands.literal("ksel")
                     .then(ClientCommands.literal("off")
                             .executes(context -> {
-                                splitTest.stop(true);
+                                seller.stop(true);
                                 return 1;
                             })));
         });
 
-        ClientTickEvents.END_CLIENT_TICK.register(splitTest::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(seller::tick);
     }
 
-    private static final class SplitTest {
+    private static final class Seller {
         private enum State {
             IDLE,
             MOVE_DEDICATED_TO_BUFFER,
@@ -48,23 +48,27 @@ public final class KSellClient implements ClientModInitializer {
             PLACE_ONE,
             RETURN_REMAINDER,
             VERIFY,
-            DONE
+            SELL,
+            WAIT_FOR_SALE,
+            RESTORE_BUFFER
         }
 
         private boolean enabled;
+        private long price;
         private int dedicatedHotbarSlot;
         private int sourceInventorySlot = -1;
         private int bufferInventorySlot = -1;
         private State state = State.IDLE;
         private int waitTicks;
 
-        void start(long ignoredPrice) {
+        void start(long newPrice) {
             Minecraft client = Minecraft.getInstance();
             if (client.player == null) {
                 return;
             }
 
             enabled = true;
+            price = newPrice;
             dedicatedHotbarSlot = client.player.getInventory().getSelectedSlot();
             sourceInventorySlot = -1;
             bufferInventorySlot = -1;
@@ -72,7 +76,7 @@ public final class KSellClient implements ClientModInitializer {
             waitTicks = 0;
 
             client.player.sendSystemMessage(Component.literal(
-                    "KSell: DIAGNOSTIC ON. Splitting exactly 1 Respawn Anchor. No selling."
+                    "KSell: ON, selling Respawn Anchors for $" + newPrice + " each."
             ));
         }
 
@@ -84,9 +88,7 @@ public final class KSellClient implements ClientModInitializer {
             bufferInventorySlot = -1;
 
             if (announce && Minecraft.getInstance().player != null) {
-                Minecraft.getInstance().player.sendSystemMessage(
-                        Component.literal("KSell: OFF")
-                );
+                Minecraft.getInstance().player.sendSystemMessage(Component.literal("KSell: OFF"));
             }
         }
 
@@ -119,24 +121,23 @@ public final class KSellClient implements ClientModInitializer {
             switch (state) {
                 case IDLE -> begin(client, inventory, dedicated, carried);
                 case MOVE_DEDICATED_TO_BUFFER ->
-                        moveDedicatedToBuffer(client, inventory, dedicated, carried);
+                        moveDedicatedToBuffer(client, dedicated, carried);
                 case PLACE_DEDICATED_IN_BUFFER ->
                         placeDedicatedInBuffer(client, inventory, dedicated, carried);
                 case PICKUP_SOURCE ->
                         pickupSource(client, inventory, dedicated, carried);
                 case PLACE_ONE ->
-                        placeOne(client, inventory, dedicated, carried);
+                        placeOne(client, dedicated, carried);
                 case RETURN_REMAINDER ->
                         returnRemainder(client, inventory, dedicated, carried);
                 case VERIFY ->
                         verify(client, inventory, dedicated, carried);
-                case DONE -> {
-                    enabled = false;
-                    state = State.IDLE;
-                    player.sendSystemMessage(Component.literal(
-                            "KSell: TEST COMPLETE. Selected slot contains exactly 1 Respawn Anchor. No sale performed."
-                    ));
-                }
+                case SELL ->
+                        sell(client, dedicated);
+                case WAIT_FOR_SALE ->
+                        waitForSale(client, inventory, dedicated, carried);
+                case RESTORE_BUFFER ->
+                        restoreBuffer(client, inventory, dedicated, carried);
             }
         }
 
@@ -150,9 +151,14 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
+            if (isExactlyOneAnchor(dedicated)) {
+                state = State.SELL;
+                return;
+            }
+
             sourceInventorySlot = findAnchorSlot(inventory, dedicatedHotbarSlot);
             if (sourceInventorySlot < 0) {
-                fail(client, "no Respawn Anchors found");
+                fail(client, "no Respawn Anchors left");
                 return;
             }
 
@@ -173,7 +179,6 @@ public final class KSellClient implements ClientModInitializer {
 
         private void moveDedicatedToBuffer(
                 Minecraft client,
-                Inventory inventory,
                 ItemStack dedicated,
                 ItemStack carried
         ) {
@@ -240,7 +245,6 @@ public final class KSellClient implements ClientModInitializer {
 
         private void placeOne(
                 Minecraft client,
-                Inventory inventory,
                 ItemStack dedicated,
                 ItemStack carried
         ) {
@@ -250,11 +254,9 @@ public final class KSellClient implements ClientModInitializer {
             }
 
             if (!isAnchor(carried)) {
-                if (carried.isEmpty()) {
-                    fail(client, "server did not synchronize the source stack to the cursor");
-                } else {
-                    fail(client, "cursor contains a non-anchor item");
-                }
+                fail(client, carried.isEmpty()
+                        ? "server did not synchronize the source stack to the cursor"
+                        : "cursor contains a non-anchor item");
                 return;
             }
 
@@ -314,16 +316,90 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
-            state = State.DONE;
+            state = State.SELL;
+        }
+
+        private void sell(Minecraft client, ItemStack dedicated) {
+            if (!isExactlyOneAnchor(dedicated)) {
+                state = State.IDLE;
+                return;
+            }
+
+            if (client.getConnection() == null) {
+                return;
+            }
+
+            client.getConnection().sendCommand("ah sell " + price);
+            state = State.WAIT_FOR_SALE;
+            waitTicks = 2;
+        }
+
+        private void waitForSale(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!carried.isEmpty()) {
+                return;
+            }
+
+            if (!dedicated.isEmpty()) {
+                return;
+            }
+
+            if (bufferInventorySlot >= 0 && !inventory.getItem(bufferInventorySlot).isEmpty()) {
+                state = State.RESTORE_BUFFER;
+                return;
+            }
+
+            sourceInventorySlot = -1;
+            bufferInventorySlot = -1;
+            waitTicks = 30;
+            state = State.IDLE;
+        }
+
+        private void restoreBuffer(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!carried.isEmpty()) {
+                return;
+            }
+
+            if (!dedicated.isEmpty()) {
+                sourceInventorySlot = -1;
+                bufferInventorySlot = -1;
+                waitTicks = 30;
+                state = State.IDLE;
+                return;
+            }
+
+            if (bufferInventorySlot < 0 || inventory.getItem(bufferInventorySlot).isEmpty()) {
+                bufferInventorySlot = -1;
+                waitTicks = 30;
+                state = State.IDLE;
+                return;
+            }
+
+            click(client, playerScreenSlot(bufferInventorySlot), 0, ContainerInput.PICKUP);
+            waitTicks = 1;
+            click(client, playerScreenSlot(dedicatedHotbarSlot), 0, ContainerInput.PICKUP);
+            waitTicks = 1;
+
+            sourceInventorySlot = -1;
+            bufferInventorySlot = -1;
+            waitTicks = 30;
+            state = State.IDLE;
         }
 
         private void fail(Minecraft client, String reason) {
             enabled = false;
             state = State.IDLE;
             if (client.player != null) {
-                client.player.sendSystemMessage(Component.literal(
-                        "KSell: TEST FAILED: " + reason
-                ));
+                client.player.sendSystemMessage(Component.literal("KSell: OFF, " + reason + "."));
             }
         }
 
