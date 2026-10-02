@@ -355,7 +355,7 @@ public final class KSellClient implements ClientModInitializer {
 
             sourceInventorySlot = -1;
             bufferInventorySlot = -1;
-            waitTicks = 30;
+            waitTicks = 0;
             state = State.IDLE;
         }
 
