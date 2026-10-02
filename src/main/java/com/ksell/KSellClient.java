@@ -152,7 +152,7 @@ public final class KSellClient implements ClientModInitializer {
             }
 
             if (isExactlyOneAnchor(dedicated)) {
-                state = State.SELL;
+                sell(client, dedicated);
                 return;
             }
 
@@ -316,7 +316,7 @@ public final class KSellClient implements ClientModInitializer {
                 return;
             }
 
-            state = State.SELL;
+            sell(client, dedicated);
         }
 
         private void sell(Minecraft client, ItemStack dedicated) {
@@ -331,7 +331,7 @@ public final class KSellClient implements ClientModInitializer {
 
             client.getConnection().sendCommand("ah sell " + price);
             state = State.WAIT_FOR_SALE;
-            waitTicks = 2;
+            waitTicks = 1;
         }
 
         private void waitForSale(
