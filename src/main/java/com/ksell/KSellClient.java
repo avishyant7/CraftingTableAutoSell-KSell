@@ -42,29 +42,29 @@ public final class KSellClient implements ClientModInitializer {
     private static final class SplitTest {
         private enum State {
             IDLE,
-            MOVE_DEDICATED_ITEM,
+            MOVE_DEDICATED_TO_BUFFER,
+            PLACE_DEDICATED_IN_BUFFER,
             PICKUP_SOURCE,
             PLACE_ONE,
             RETURN_REMAINDER,
+            VERIFY,
             DONE
         }
 
         private boolean enabled;
-        private long price;
         private int dedicatedHotbarSlot;
         private int sourceInventorySlot = -1;
         private int bufferInventorySlot = -1;
         private State state = State.IDLE;
         private int waitTicks;
 
-        void start(long newPrice) {
+        void start(long ignoredPrice) {
             Minecraft client = Minecraft.getInstance();
             if (client.player == null) {
                 return;
             }
 
             enabled = true;
-            price = newPrice;
             dedicatedHotbarSlot = client.player.getInventory().getSelectedSlot();
             sourceInventorySlot = -1;
             bufferInventorySlot = -1;
@@ -83,11 +83,10 @@ public final class KSellClient implements ClientModInitializer {
             sourceInventorySlot = -1;
             bufferInventorySlot = -1;
 
-            if (announce) {
-                Minecraft client = Minecraft.getInstance();
-                if (client.player != null) {
-                    client.player.sendSystemMessage(Component.literal("KSell: OFF"));
-                }
+            if (announce && Minecraft.getInstance().player != null) {
+                Minecraft.getInstance().player.sendSystemMessage(
+                        Component.literal("KSell: OFF")
+                );
             }
         }
 
@@ -119,31 +118,41 @@ public final class KSellClient implements ClientModInitializer {
 
             switch (state) {
                 case IDLE -> begin(client, inventory, dedicated, carried);
-                case MOVE_DEDICATED_ITEM -> moveDedicatedItem(client, inventory, dedicated, carried);
-                case PICKUP_SOURCE -> pickupSource(client, inventory, dedicated, carried);
-                case PLACE_ONE -> placeOne(client, inventory, dedicated, carried);
-                case RETURN_REMAINDER -> returnRemainder(client, inventory, dedicated, carried);
+                case MOVE_DEDICATED_TO_BUFFER ->
+                        moveDedicatedToBuffer(client, inventory, dedicated, carried);
+                case PLACE_DEDICATED_IN_BUFFER ->
+                        placeDedicatedInBuffer(client, inventory, dedicated, carried);
+                case PICKUP_SOURCE ->
+                        pickupSource(client, inventory, dedicated, carried);
+                case PLACE_ONE ->
+                        placeOne(client, inventory, dedicated, carried);
+                case RETURN_REMAINDER ->
+                        returnRemainder(client, inventory, dedicated, carried);
+                case VERIFY ->
+                        verify(client, inventory, dedicated, carried);
                 case DONE -> {
                     enabled = false;
                     state = State.IDLE;
                     player.sendSystemMessage(Component.literal(
-                            "KSell: TEST COMPLETE. Dedicated slot contains exactly 1 Respawn Anchor. No sale performed."
+                            "KSell: TEST COMPLETE. Selected slot contains exactly 1 Respawn Anchor. No sale performed."
                     ));
                 }
             }
         }
 
-        private void begin(Minecraft client, Inventory inventory, ItemStack dedicated, ItemStack carried) {
+        private void begin(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
             if (!carried.isEmpty()) {
                 return;
             }
 
             sourceInventorySlot = findAnchorSlot(inventory, dedicatedHotbarSlot);
             if (sourceInventorySlot < 0) {
-                stop(false);
-                client.player.sendSystemMessage(Component.literal(
-                        "KSell: OFF, no Respawn Anchors found."
-                ));
+                fail(client, "no Respawn Anchors found");
                 return;
             }
 
@@ -152,25 +161,24 @@ public final class KSellClient implements ClientModInitializer {
                         inventory, sourceInventorySlot, dedicatedHotbarSlot
                 );
                 if (bufferInventorySlot < 0) {
-                    client.player.sendSystemMessage(Component.literal(
-                            "KSell: TEST PAUSED. Selected hotbar slot is occupied and no empty inventory slot is available."
-                    ));
+                    fail(client, "selected hotbar slot is occupied and no empty buffer slot exists");
                     return;
                 }
-                state = State.MOVE_DEDICATED_ITEM;
+                state = State.MOVE_DEDICATED_TO_BUFFER;
                 return;
             }
 
             state = State.PICKUP_SOURCE;
         }
 
-        private void moveDedicatedItem(
+        private void moveDedicatedToBuffer(
                 Minecraft client,
                 Inventory inventory,
                 ItemStack dedicated,
                 ItemStack carried
         ) {
             if (!carried.isEmpty()) {
+                fail(client, "cursor was not empty before moving the selected item");
                 return;
             }
 
@@ -181,6 +189,32 @@ public final class KSellClient implements ClientModInitializer {
 
             click(client, playerScreenSlot(dedicatedHotbarSlot), 0, ContainerInput.PICKUP);
             waitTicks = 1;
+            state = State.PLACE_DEDICATED_IN_BUFFER;
+        }
+
+        private void placeDedicatedInBuffer(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (dedicated.isEmpty() && !carried.isEmpty()) {
+                click(client, playerScreenSlot(bufferInventorySlot), 0, ContainerInput.PICKUP);
+                waitTicks = 1;
+                return;
+            }
+
+            if (carried.isEmpty() && dedicated.isEmpty()
+                    && !inventory.getItem(bufferInventorySlot).isEmpty()) {
+                state = State.PICKUP_SOURCE;
+                return;
+            }
+
+            if (!carried.isEmpty() || !dedicated.isEmpty()) {
+                return;
+            }
+
+            fail(client, "failed to move the selected item into the buffer");
         }
 
         private void pickupSource(
@@ -194,8 +228,8 @@ public final class KSellClient implements ClientModInitializer {
             }
 
             ItemStack source = inventory.getItem(sourceInventorySlot);
-            if (!isAnchor(source) || source.getCount() < 1) {
-                fail(client, "source anchor stack changed before pickup");
+            if (!isAnchor(source)) {
+                fail(client, "source anchor stack disappeared or changed");
                 return;
             }
 
@@ -210,18 +244,17 @@ public final class KSellClient implements ClientModInitializer {
                 ItemStack dedicated,
                 ItemStack carried
         ) {
-            if (dedicated.isEmpty() && carried.isEmpty()) {
-                fail(client, "server did not give the source stack to the cursor");
-                return;
-            }
-
             if (!dedicated.isEmpty()) {
-                fail(client, "dedicated slot became occupied before the one-item split");
+                fail(client, "selected slot became occupied before the split");
                 return;
             }
 
-            if (!isAnchor(carried) || carried.getCount() < 1) {
-                fail(client, "cursor does not contain Respawn Anchors");
+            if (!isAnchor(carried)) {
+                if (carried.isEmpty()) {
+                    fail(client, "server did not synchronize the source stack to the cursor");
+                } else {
+                    fail(client, "cursor contains a non-anchor item");
+                }
                 return;
             }
 
@@ -237,36 +270,51 @@ public final class KSellClient implements ClientModInitializer {
                 ItemStack carried
         ) {
             if (!isExactlyOneAnchor(dedicated)) {
-                if (carried.isEmpty()) {
-                    fail(client, "one-item placement was not synchronized");
-                }
                 return;
             }
 
             if (carried.isEmpty()) {
-                fail(client, "cursor became empty before returning the remainder");
+                state = State.VERIFY;
                 return;
             }
 
             if (!isAnchor(carried)) {
-                fail(client, "cursor changed to a non-anchor item");
+                fail(client, "cursor changed to a non-anchor item after placing one");
                 return;
             }
 
             ItemStack source = inventory.getItem(sourceInventorySlot);
-
-            if (source.isEmpty()) {
-                click(client, playerScreenSlot(sourceInventorySlot), 0, ContainerInput.PICKUP);
-                waitTicks = 1;
+            if (!source.isEmpty()) {
+                fail(client, "source slot was not empty when returning the remainder");
                 return;
             }
 
-            if (!isAnchor(source)) {
-                fail(client, "source slot changed to a different item");
+            click(client, playerScreenSlot(sourceInventorySlot), 0, ContainerInput.PICKUP);
+            waitTicks = 1;
+        }
+
+        private void verify(
+                Minecraft client,
+                Inventory inventory,
+                ItemStack dedicated,
+                ItemStack carried
+        ) {
+            if (!carried.isEmpty()) {
                 return;
             }
 
-            fail(client, "source slot was not empty after pickup; server rejected the transaction");
+            if (!isExactlyOneAnchor(dedicated)) {
+                fail(client, "selected slot is not exactly 1 Respawn Anchor");
+                return;
+            }
+
+            ItemStack source = inventory.getItem(sourceInventorySlot);
+            if (!source.isEmpty() && !isAnchor(source)) {
+                fail(client, "source slot contains the wrong item");
+                return;
+            }
+
+            state = State.DONE;
         }
 
         private void fail(Minecraft client, String reason) {
