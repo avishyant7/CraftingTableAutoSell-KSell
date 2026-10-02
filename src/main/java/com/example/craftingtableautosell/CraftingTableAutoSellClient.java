@@ -37,9 +37,9 @@ public final class CraftingTableAutoSellClient implements ClientModInitializer {
                 .executes(context -> { manager.resetSellPrice(Minecraft.getInstance()); return 1; }));
             dispatcher.register(LiteralArgumentBuilder.<FabricClientCommandSource>literal("ksell")
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("on")
-                    .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("hand")
-                        .then(RequiredArgumentBuilder.<FabricClientCommandSource, Integer>argument("price", IntegerArgumentType.integer(1))
-                            .executes(context -> { kSellManager.startFromHand(IntegerArgumentType.getInteger(context, "price"), Minecraft.getInstance()); return 1; }))))
+                    .then(RequiredArgumentBuilder.<FabricClientCommandSource, Integer>argument("price", IntegerArgumentType.integer(1))
+                        .executes(context -> { kSellManager.start(IntegerArgumentType.getInteger(context, "price"), Minecraft.getInstance()); return 1; }))));
+            dispatcher.register(LiteralArgumentBuilder.<FabricClientCommandSource>literal("ksel")
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("off")
                     .executes(context -> { kSellManager.stop(Minecraft.getInstance()); return 1; })));
         });
